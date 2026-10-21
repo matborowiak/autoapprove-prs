@@ -1,0 +1,143 @@
+#!/bin/bash
+# autoapprove-prs: approve open PRs in a GitHub repo, but only those authored by an explicit allowlist.
+# Written for macOS /bin/bash 3.2: no associative arrays, no ${var,,}.
+
+VERSION=1.0.0
+PROG=$(basename "$0")
+
+usage() {
+  cat <<USAGE
+$PROG $VERSION - approve open GitHub PRs from an allowlist of authors, using the gh CLI.
+
+Usage:
+  $PROG --repo <repo> --author <handle> [--author <handle>...] [options]
+
+Required:
+  -r, --repo <repo>       Repository to watch. Accepts any of:
+                            https://github.com/owner/name
+                            https://github.com/owner/name/pull/57
+                            git@github.com:owner/name.git
+                            owner/name
+  -a, --author <handle>   GitHub login whose PRs may be approved. Repeat the flag
+                          or pass a comma-separated list. PRs by anyone else are
+                          never approved. Matching ignores case. Bots use the
+                          login gh reports, e.g. app/dependabot.
+
+Options:
+  -n, --dry-run           Print what would be approved; don't approve.
+      --include-drafts    Approve draft PRs too (they are skipped by default).
+  -q, --quiet             Print only approvals and errors.
+      --no-notify         Don't show a macOS notification on approval.
+  -h, --help              Show this help.
+  -V, --version           Show the version.
+
+Always skipped: your own PRs, and PRs you already approved at their current
+head commit. A new push to a PR makes it eligible again.
+
+Auth: whatever gh uses (GH_TOKEN, GITHUB_TOKEN, or 'gh auth login'). Schedulers
+like launchd and cron don't load your shell profile; if your token only lives
+there, pass --token-cmd:
+      --token-cmd <cmd>   Shell command that prints a token, exported as GH_TOKEN.
+                          e.g. 'security find-generic-password -s gh-token -w'
+
+Exit codes: 0 ok, 1 runtime/gh error, 2 usage error.
+
+Examples:
+  $PROG -r https://github.com/acme/widgets -a alice
+  $PROG -r acme/widgets -a alice,bob,app/dependabot --dry-run
+USAGE
+}
+
+die_usage() { echo "$PROG: $1" >&2; echo "Run '$PROG --help' for usage." >&2; exit 2; }
+log() { [ "$QUIET" = 1 ] || echo "$@"; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Normalise any GitHub repo reference to owner/name.
+parse_repo() {
+  local r=$1
+  r=${r#https://}; r=${r#http://}; r=${r#git@}; r=${r#www.}
+  r=${r#github.com/}; r=${r#github.com:}
+  r=${r%.git}; r=${r%/}
+  local owner name
+  owner=$(printf '%s' "$r" | cut -d/ -f1)
+  name=$(printf '%s' "$r" | cut -d/ -f2)
+  name=${name%.git}
+  case "$owner/$name" in
+    */|/*|*[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  [ -n "$owner" ] && [ -n "$name" ] && [ "$owner" != "$r" ] || return 1
+  echo "$owner/$name"
+}
+
+REPO_ARG=""; TOKEN_CMD=""; AUTHORS=(); DRY_RUN=0; INCLUDE_DRAFTS=0; QUIET=0; NOTIFY=1
+
+add_authors() {
+  local IFS=, h
+  for h in $1; do
+    h=$(printf '%s' "$h" | tr -d '[:space:]'); h=${h#@}
+    [ -n "$h" ] && AUTHORS+=("$(lower "$h")")
+  done
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--repo)     [ -n "$2" ] || die_usage "$1 needs a value"; REPO_ARG=$2; shift 2 ;;
+    --repo=*)      REPO_ARG=${1#*=}; shift ;;
+    -a|--author)   [ -n "$2" ] || die_usage "$1 needs a value"; add_authors "$2"; shift 2 ;;
+    --author=*)    add_authors "${1#*=}"; shift ;;
+    --token-cmd)   [ -n "$2" ] || die_usage "$1 needs a value"; TOKEN_CMD=$2; shift 2 ;;
+    --token-cmd=*) TOKEN_CMD=${1#*=}; shift ;;
+    -n|--dry-run)  DRY_RUN=1; shift ;;
+    --include-drafts) INCLUDE_DRAFTS=1; shift ;;
+    -q|--quiet)    QUIET=1; shift ;;
+    --no-notify)   NOTIFY=0; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -V|--version)  echo "$PROG $VERSION"; exit 0 ;;
+    *)             die_usage "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$REPO_ARG" ] || die_usage "--repo is required"
+[ ${#AUTHORS[@]} -gt 0 ] || die_usage "at least one --author is required"
+REPO=$(parse_repo "$REPO_ARG") || die_usage "can't parse a GitHub repo from: $REPO_ARG"
+
+command -v gh >/dev/null || { echo "$PROG: gh CLI not found on PATH" >&2; exit 1; }
+
+if [ -n "$TOKEN_CMD" ]; then
+  GH_TOKEN=$(/bin/sh -c "$TOKEN_CMD") && [ -n "$GH_TOKEN" ] \
+    || { echo "$PROG: --token-cmd printed no token" >&2; exit 1; }
+  export GH_TOKEN
+fi
+
+is_allowed() {
+  local a h; a=$(lower "$1")
+  for h in "${AUTHORS[@]}"; do [ "$a" = "$h" ] && return 0; done
+  return 1
+}
+
+ME=$(gh api user --jq .login) || { echo "$PROG: gh is not authenticated" >&2; exit 1; }
+prs=$(gh pr list -R "$REPO" --state open --limit 200 --json number,isDraft,headRefOid,author,title \
+  --jq '.[] | "\(.number)\t\(.isDraft)\t\(.headRefOid)\t\(.author.login)\t\(.title)"') \
+  || { echo "$PROG: couldn't list PRs in $REPO" >&2; exit 1; }
+
+log "--- $(date '+%Y-%m-%d %H:%M:%S') $REPO as $ME, authors: ${AUTHORS[*]}$([ $DRY_RUN = 1 ] && echo ' (dry run)')"
+[ -n "$prs" ] || { log "no open PRs"; exit 0; }
+
+status=0
+while IFS=$'\t' read -r num draft head author title; do
+  if ! is_allowed "$author"; then log "#$num skip (author $author not allowed)"; continue; fi
+  if [ "$(lower "$author")" = "$(lower "$ME")" ]; then log "#$num skip (own PR)"; continue; fi
+  if [ "$draft" = "true" ] && [ $INCLUDE_DRAFTS = 0 ]; then log "#$num skip (draft)"; continue; fi
+  approved=$(gh api "repos/$REPO/pulls/$num/reviews" --paginate \
+    --jq "[.[] | select(.user.login==\"$ME\" and .state==\"APPROVED\" and .commit_id==\"$head\")] | length") \
+    || { echo "#$num error reading reviews" >&2; status=1; continue; }
+  if [ "$approved" != "0" ]; then log "#$num skip (already approved at ${head:0:7})"; continue; fi
+  if [ $DRY_RUN = 1 ]; then echo "#$num WOULD APPROVE: $title ($author)"; continue; fi
+  if gh pr review "$num" -R "$REPO" --approve >/dev/null; then
+    echo "#$num APPROVED: $title ($author)"
+    [ $NOTIFY = 1 ] && osascript -e "display notification \"#$num $(printf '%s' "$title" | tr -d '"\\')\" with title \"Approved PR in $REPO\"" 2>/dev/null
+  else
+    echo "#$num error approving" >&2; status=1
+  fi
+done <<< "$prs"
+exit $status
