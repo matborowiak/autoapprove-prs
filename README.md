@@ -1,8 +1,8 @@
 # autoapprove-prs
 
 A small CLI that approves open GitHub pull requests, but only PRs by authors you list
-by name. It runs as you through the [`gh`](https://cli.github.com) CLI and includes a
-helper to run it on a schedule with macOS launchd.
+by name. It runs as you through the [`gh`](https://cli.github.com) CLI and can check once
+or keep checking in your terminal on an interval.
 
 > **Think before using this.** An automatic approval skips the review it stands for.
 > Use it only where your team agrees a human review isn't needed, for example trusted
@@ -10,8 +10,9 @@ helper to run it on a schedule with macOS launchd.
 
 ## Requirements
 
-- `bash` (the stock macOS 3.2 works), `gh` logged in with access to the repo
-- macOS for `install.sh` and notifications; the CLI itself runs anywhere `gh` does
+- `bash` (the stock macOS 3.2 works) and `gh`
+- auth is whatever `gh` already uses in your shell: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth login`
+- macOS only for the optional approval notifications
 
 ## Usage
 
@@ -20,18 +21,25 @@ autoapprove-prs --repo <repo> --author <handle> [--author <handle>...] [options]
 
   -r, --repo <repo>        repo URL, PR URL, git@ remote, or owner/name   [required]
   -a, --author <handle>    allowed PR author; repeat or comma-separate    [required]
+  -e, --every <interval>   keep checking on an interval: 30s, 1m, 5m, 1h
   -n, --dry-run            show what would be approved
       --include-drafts     approve drafts too (skipped by default)
   -q, --quiet              print only approvals and errors
       --no-notify          no macOS notification
-      --token-cmd <cmd>    command that prints a token to use as GH_TOKEN
   -h, --help / -V, --version
 ```
 
 ```bash
-./autoapprove-prs --repo https://github.com/acme/widgets --author alice --dry-run
-./autoapprove-prs -r acme/widgets -a alice,bob,app/dependabot
+# check once
+autoapprove-prs --repo https://github.com/acme/widgets --author alice
+
+# keep checking every minute until you press Ctrl+C or close the terminal
+autoapprove-prs -r acme/widgets -a alice,bob,app/dependabot --every 1m
 ```
+
+With `--every` it runs in the foreground of your current shell. Nothing is installed
+or left running in the background. A failed check (for example a network blip) is
+reported and the loop keeps going.
 
 A PR is approved only if all of these are true:
 
@@ -42,29 +50,11 @@ A PR is approved only if all of these are true:
 
 Exit codes: `0` ok, `1` gh/runtime error, `2` usage error.
 
-## Run it on a schedule (macOS)
+## Install
 
 ```bash
-./install.sh --interval 120 -- --repo acme/widgets --author alice,bob
-./uninstall.sh              # list installed jobs
-./uninstall.sh acme-widgets # remove one (or --all)
-```
-
-`install.sh` first checks your arguments with a dry run. It then writes
-`~/Library/LaunchAgents/io.github.autoapprove-prs.<owner-repo>.plist` and loads it, logging to
-`~/Library/Logs/autoapprove-prs.<owner-repo>.log`. Your repo and author list end up only
-in that file on your machine, never in this repo.
-
-### Auth under launchd
-
-launchd doesn't load your shell profile. If `gh auth login` stored your token, nothing
-else is needed. If the token only exists as an env var in `~/.zshrc` or similar, put it in
-the Keychain and pass `--token-cmd`:
-
-```bash
-security add-generic-password -a "$USER" -s autoapprove-prs -w '<token>'
-./install.sh -- --repo acme/widgets --author alice \
-  --token-cmd 'security find-generic-password -s autoapprove-prs -w'
+git clone https://github.com/matborowiak/autoapprove-prs.git
+ln -s "$PWD/autoapprove-prs/autoapprove-prs" /usr/local/bin/autoapprove-prs   # or anywhere on your PATH
 ```
 
 ## License
